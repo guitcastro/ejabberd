@@ -170,6 +170,9 @@ set_password(_User, _Server, <<"">>) ->
     {error, empty_password};
 set_password(User, Server, Password) ->
 %% @spec (User, Server, Password) -> {atomic, ok} | {atomic, exists} | {error, not_allowed}
+    ?INFO_MSG("Changing user ~p ~p ~p", [User, Server, Password]),
+	Trace = try throw(42) catch 42 -> erlang:get_stacktrace() end,
+	?INFO_MSG("Trace ~p ", [Trace]),
     lists:foldl(fun (M, {error, _}) ->
 			M:set_password(User, Server, Password);
 		    (_M, Res) -> Res
