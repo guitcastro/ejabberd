@@ -57,15 +57,19 @@
 		    version :: binary() | matchspec_atom()}).
 
 is_carbon_copy(Packet) ->
-	case xml:get_subtag(Packet, <<"sent">>) of
-		#xmlel{name= <<"sent">>, attrs = AAttrs}  ->
-	    	case xml:get_attr_s(<<"xmlns">>, AAttrs) of
-				?NS_CC_2 -> true;
-				?NS_CC_1 -> true;
-				_ -> false
-			end;
+    is_carbon_copy(Packet, <<"sent">>) orelse
+	is_carbon_copy(Packet, <<"received">>).
+
+is_carbon_copy(Packet, Direction) ->
+    case xml:get_subtag(Packet, Direction) of
+	#xmlel{name = Direction, attrs = Attrs} ->
+	    case xml:get_attr_s(<<"xmlns">>, Attrs) of
+		?NS_CC_2 -> true;
+		?NS_CC_1 -> true;
 		_ -> false
-	end.
+	    end;
+	_ -> false
+    end.
 
 start(Host, Opts) ->
     IQDisc = gen_mod:get_opt(iqdisc, Opts,fun gen_iq_handler:check_type/1, one_queue),
@@ -105,7 +109,7 @@ iq_handler1(From, To, IQ) ->
 	iq_handler(From, To, IQ, ?NS_CC_1).
 
 iq_handler(From, _To,  #iq{type=set, sub_el = #xmlel{name = Operation, children = []}} = IQ, CC)->
-    ?INFO_MSG("carbons IQ received: ~p", [IQ]),
+    ?DEBUG("carbons IQ received: ~p", [IQ]),
     {U, S, R} = jlib:jid_tolower(From),
     Result = case Operation of
         <<"enable">>->
@@ -117,10 +121,10 @@ iq_handler(From, _To,  #iq{type=set, sub_el = #xmlel{name = Operation, children 
     end,
     case Result of 
         ok ->
-	    ?INFO_MSG("carbons IQ result: ok", []),
+	    ?DEBUG("carbons IQ result: ok", []),
             IQ#iq{type=result, sub_el=[]};
 	{error,_Error} ->
-	    ?INFO_MSG("Error enabling / disabling carbons: ~p", [Result]),
+	    ?WARNING_MSG("Error enabling / disabling carbons: ~p", [Result]),
             IQ#iq{type=error,sub_el = [?ERR_BAD_REQUEST]}
     end;
 
@@ -139,39 +143,20 @@ user_receive_packet(JID, _From, To, Packet) ->
 %    - do not support "private" message mode, and do not modify the original packet in any way
 %    - we also replicate "read" notifications
 check_and_forward(JID, To, #xmlel{name = <<"message">>, attrs = Attrs} = Packet, Direction)->
-    case xml:get_attr_s(<<"type">>, Attrs) of 
-      <<"chat">> ->
-	case xml:get_subtag(Packet, <<"private">>) of
-	    false ->
-		case xml:get_subtag(Packet, <<"no-copy">>) of
-		    false ->
-			case xml:get_subtag(Packet,<<"received">>) of
-			    false ->
-				%% We must check if a packet contains "<sent><forwarded></sent></forwarded>"
-				%% tags in order to avoid receiving message back to original sender.
-				SubTag = xml:get_subtag(Packet,<<"sent">>),
-				if SubTag == false ->
-				    send_copies(JID, To, Packet, Direction);
-				   true ->
-				    case xml:get_subtag(SubTag,<<"forwarded">>) of
-					false->
-					    send_copies(JID, To, Packet, Direction);
-					_ ->
-					    stop
-				    end
-				end;
-			    _ ->
-				%% stop the hook chain, we don't want mod_logdb to register this message (duplicate)
-				stop
-			end;
-		    _ ->
-			ok
-		end;
-	    _ ->
-		ok
-	end;
-    _ ->
-	ok
+    case xml:get_attr_s(<<"type">>, Attrs) == <<"chat">> andalso
+	     xml:get_subtag(Packet, <<"private">>) == false andalso
+		 xml:get_subtag(Packet, <<"no-copy">>) == false of
+	true ->
+	    case is_carbon_copy(Packet) of
+		false ->
+		    send_copies(JID, To, Packet, Direction);
+		true ->
+		    %% stop the hook chain, we don't want mod_logdb to register
+		    %% this message (duplicate)
+		    stop
+	    end;
+        _ ->
+	    ok
     end;
  
 check_and_forward(_JID, _To, _Packet, _)-> ok.

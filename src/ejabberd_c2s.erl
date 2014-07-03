@@ -763,8 +763,7 @@ wait_for_feature_request({xmlstreamelement, El},
 				    children =
 					[#xmlel{name = Error, attrs = [],
 						children = []}]}),
-		{next_state, wait_for_feature_request, StateData,
-		 ?C2S_OPEN_TIMEOUT};
+		fsm_next_state(wait_for_feature_request, StateData);
 	    {error, Error} ->
 		send_element(StateData,
 			     #xmlel{name = <<"failure">>,
@@ -1170,10 +1169,8 @@ session_established({xmlstreamerror, _}, StateData) ->
     {stop, normal, StateData};
 session_established(closed, StateData)
     when StateData#state.mgmt_timeout > 0,
-	 StateData#state.mgmt_state == active orelse
-	 StateData#state.mgmt_state == pending ->
-    log_pending_state(StateData),
-    fsm_next_state(wait_for_resume, StateData#state{mgmt_state = pending});
+	 StateData#state.mgmt_state == active ->
+    fsm_next_state(wait_for_resume, StateData);
 session_established(closed, StateData) ->
     {stop, normal, StateData}.
 
@@ -1312,8 +1309,8 @@ handle_sync_event(get_subscribed, _From, StateName,
 		  StateData) ->
     Subscribed = (?SETS):to_list(StateData#state.pres_f),
     {reply, Subscribed, StateName, StateData};
-handle_sync_event(resume_session, _From, _StateName,
-		  StateData) ->
+handle_sync_event({resume_session, Time}, _From, _StateName,
+		  StateData) when element(1, StateData#state.sid) == Time ->
     %% The old session should be closed before the new one is opened, so we do
     %% this here instead of leaving it to the terminate callback
     ejabberd_sm:close_session(StateData#state.sid,
@@ -1321,6 +1318,9 @@ handle_sync_event(resume_session, _From, _StateName,
 			      StateData#state.server,
 			      StateData#state.resource),
     {stop, normal, {ok, StateData}, StateData#state{mgmt_state = resumed}};
+handle_sync_event({resume_session, _Time}, _From, StateName,
+		  StateData) ->
+    {reply, {error, <<"Previous session not found">>}, StateName, StateData};
 handle_sync_event(_Event, _From, StateName,
 		  StateData) ->
     Reply = ok, fsm_reply(Reply, StateName, StateData).
@@ -1373,7 +1373,6 @@ handle_info({route, _From, _To, {broadcast, Data}},
                     fsm_next_state(StateName, StateData);
                 NewPL ->
                     PrivPushIQ = #iq{type = set,
-                                     xmlns = ?NS_PRIVACY,
                                      id = <<"push",
                                             (randoms:get_string())/binary>>,
                                      sub_el =
@@ -1657,9 +1656,7 @@ handle_info({'DOWN', Monitor, _Type, _Object, _Info},
     if StateData#state.mgmt_timeout > 0,
        StateData#state.mgmt_state == active orelse
        StateData#state.mgmt_state == pending ->
-	   log_pending_state(StateData),
-	   fsm_next_state(wait_for_resume,
-			  StateData#state{mgmt_state = pending});
+	   fsm_next_state(wait_for_resume, StateData);
        true ->
 	   {stop, normal, StateData}
     end;
@@ -1691,7 +1688,7 @@ handle_info({force_update_presence, LUser}, StateName,
 			 StateData2;
 		     _ -> StateData
 		   end,
-    {next_state, StateName, NewStateData};
+    fsm_next_state(StateName, NewStateData);
 handle_info({broadcast, Type, From, Packet}, StateName, StateData) ->
     Recipients = ejabberd_hooks:run_fold(
 		   c2s_broadcast_recipients, StateData#state.server,
@@ -1811,6 +1808,14 @@ send_text(StateData, Text) when StateData#state.xml_socket ->
     ?DEBUG("Send Text on stream = ~p", [Text]),
     (StateData#state.sockmod):send_xml(StateData#state.socket, 
 				       {xmlstreamraw, Text});
+send_text(StateData, Text) when StateData#state.mgmt_state == active ->
+    ?DEBUG("Send XML on stream = ~p", [Text]),
+    case catch (StateData#state.sockmod):send(StateData#state.socket, Text) of
+      {'EXIT', _} ->
+	  (StateData#state.sockmod):close(StateData#state.socket);
+      _ ->
+	  ok
+    end;
 send_text(StateData, Text) ->
     ?DEBUG("Send XML on stream = ~p", [Text]),
     (StateData#state.sockmod):send(StateData#state.socket, Text).
@@ -2427,10 +2432,12 @@ fsm_next_state_gc(StateName, PackedStateData) ->
 fsm_next_state(session_established, StateData) ->
     {next_state, session_established, StateData,
      ?C2S_HIBERNATE_TIMEOUT};
-fsm_next_state(wait_for_resume, #state{mgmt_pending_since = undefined} =
-	       StateData) ->
+fsm_next_state(wait_for_resume, StateData)
+    when StateData#state.mgmt_state /= pending ->
+    ?INFO_MSG("Waiting for resumption of stream for ~s",
+	      [jlib:jid_to_string(StateData#state.jid)]),
     {next_state, wait_for_resume,
-     StateData#state{mgmt_pending_since = os:timestamp()},
+     StateData#state{mgmt_state = pending, mgmt_pending_since = os:timestamp()},
      StateData#state.mgmt_timeout};
 fsm_next_state(wait_for_resume, StateData) ->
     Diff = timer:now_diff(os:timestamp(), StateData#state.mgmt_pending_since),
@@ -2541,8 +2548,7 @@ route_blocking(What, StateData) ->
 		  #xmlel{name = <<"unblock">>,
 			 attrs = [{<<"xmlns">>, ?NS_BLOCKING}], children = []}
 	    end,
-    PrivPushIQ = #iq{type = set, xmlns = ?NS_BLOCKING,
-		     id = <<"push">>, sub_el = [SubEl]},
+    PrivPushIQ = #iq{type = set, id = <<"push">>, sub_el = [SubEl]},
     PrivPushEl =
 	jlib:replace_from_to(jlib:jid_remove_resource(StateData#state.jid),
 			     StateData#state.jid, jlib:iq_to_xml(PrivPushIQ)),
@@ -2773,36 +2779,33 @@ mgmt_queue_add(StateData, El) ->
 	       Num ->
 		   Num + 1
 	     end,
-    NewState = limit_queue_length(StateData),
-    NewQueue = queue:in({NewNum, El}, NewState#state.mgmt_queue),
-    NewState#state{mgmt_queue = NewQueue, mgmt_stanzas_out = NewNum}.
+    NewQueue = queue:in({NewNum, El}, StateData#state.mgmt_queue),
+    NewState = StateData#state{mgmt_queue = NewQueue,
+			       mgmt_stanzas_out = NewNum},
+    check_queue_length(NewState).
 
 mgmt_queue_drop(StateData, NumHandled) ->
     NewQueue = jlib:queue_drop_while(fun({N, _Stanza}) -> N =< NumHandled end,
 				     StateData#state.mgmt_queue),
     StateData#state{mgmt_queue = NewQueue}.
 
-limit_queue_length(#state{mgmt_max_queue = Limit} = StateData)
+check_queue_length(#state{mgmt_max_queue = Limit} = StateData)
     when Limit == infinity;
 	 Limit == unlimited ->
     StateData;
-limit_queue_length(#state{jid = JID,
-			  mgmt_queue = Queue,
+check_queue_length(#state{mgmt_queue = Queue,
 			  mgmt_max_queue = Limit} = StateData) ->
-    case queue:len(Queue) >= Limit of
+    case queue:len(Queue) > Limit of
       true ->
-	  ?WARNING_MSG("Dropping stanza from too long ACK queue for ~s",
-		       [jlib:jid_to_string(JID)]),
-	  limit_queue_length(StateData#state{mgmt_queue = queue:drop(Queue)});
+	  ?WARNING_MSG("ACK queue too long, terminating session for ~s",
+		       [jlib:jid_to_string(StateData#state.jid)]),
+	  Lang = StateData#state.lang,
+	  Err = ?SERRT_POLICY_VIOLATION(Lang, <<"Too many unacked stanzas">>),
+	  self() ! {kick, queue_overflow, Err},
+	  StateData#state{mgmt_resend = false}; % Don't resend the flood!
       false ->
 	  StateData
     end.
-
-log_pending_state(StateData) when StateData#state.mgmt_state /= pending ->
-    ?INFO_MSG("Waiting for resumption of stream for ~s",
-	      [jlib:jid_to_string(StateData#state.jid)]);
-log_pending_state(_StateData) ->
-    ok.
 
 handle_unacked_stanzas(StateData, F)
     when StateData#state.mgmt_state == active;
@@ -2894,8 +2897,8 @@ inherit_session_state(#state{user = U, server = S} = StateData, ResumeID) ->
 		{error, <<"Previous session PID not found">>};
 	    OldPID ->
 		OldSID = {Time, OldPID},
-		case catch resume_session(OldPID) of
-		  {ok, #state{sid = OldSID} = OldStateData} ->
+		case catch resume_session(OldSID) of
+		  {ok, OldStateData} ->
 		      NewSID = {Time, self()}, % Old time, new PID
 		      Priority = case OldStateData#state.pres_last of
 				   undefined ->
@@ -2927,6 +2930,8 @@ inherit_session_state(#state{user = U, server = S} = StateData, ResumeID) ->
 					   mgmt_stanzas_in = OldStateData#state.mgmt_stanzas_in,
 					   mgmt_stanzas_out = OldStateData#state.mgmt_stanzas_out,
 					   mgmt_state = active}};
+		  {error, Msg} ->
+		      {error, Msg};
 		  _ ->
 		      {error, <<"Cannot grab session state">>}
 		end
@@ -2935,8 +2940,8 @@ inherit_session_state(#state{user = U, server = S} = StateData, ResumeID) ->
 	  {error, <<"Invalid 'previd' value">>}
     end.
 
-resume_session(FsmRef) ->
-    (?GEN_FSM):sync_send_all_state_event(FsmRef, resume_session, 3000).
+resume_session({Time, PID}) ->
+    (?GEN_FSM):sync_send_all_state_event(PID, {resume_session, Time}, 3000).
 
 make_resume_id(StateData) ->
     {Time, _} = StateData#state.sid,
