@@ -378,6 +378,7 @@ try_register(User, Server, Password, SourceRaw, Lang) ->
 	    {_, deny} -> {error, ?ERR_FORBIDDEN};
 	    {allow, allow} ->
 		Source = may_remove_resource(SourceRaw),
+
 		case is_strong_password(Server, Password) of
 			true ->
 			    case ejabberd_auth:try_register(User, Server,
@@ -403,7 +404,7 @@ try_register(User, Server, Password, SourceRaw, Lang) ->
 			false ->
 			    ErrText = <<"The password is too weak">>,
 			    {error, ?ERRT_NOT_ACCEPTABLE(Lang, ErrText)}
-		      end;		  
+		end
 	  end
     end.
 
